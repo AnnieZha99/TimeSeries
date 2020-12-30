@@ -1,0 +1,334 @@
+---
+title: "The relationship between the changes of real GDP and delinquency rates"
+author: "Yingfei Zha"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: true
+    toc_depth: 2
+    highlight: tango
+    theme: yeti
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(xts)
+library(timeSeries)
+library(forecast)
+library(ggplot2)
+library(knitr)
+library(readxl)
+library(MASS)
+library(forecast)
+library(timeDate)
+library(sarima)
+library(DT)
+library(gridExtra)
+library(dynlm)
+
+PreWhiten.arma<- function(x , ar = NULL, ma = 0){
+        if(is.null(ar) && is.null(ma)) print("both ar and ma coefficients are empty!")
+        pwData = numeric(0)
+        m = as(modelCoef(new("ArmaModel", ar = ar, ma = ma)), "list")
+        eps = numeric(length(x))
+        pwData = xarmaFilter(m, x =x, eps = eps, whiten = TRUE) 
+        pwData[!is.na(pwData)]
+}
+PreWhiten.ar<- function(x , ar = NULL){
+        if(is.null(ar)) print(" autoregressive coefficients are empty!")
+        pwData = numeric(0)
+        pwData = filter(x, c(1, -ar),method=c("convo"),sides=1) 
+        pwData[!is.na(pwData)]
+}
+
+LBTest<- function(res, nPQ = 0, m = 24, ifPlot = FALSE){
+        stopifnot(nPQ >= 0, m >= 1, m > nPQ)
+        n <- length(res)
+        lags <- 1:m
+        df <- (nPQ+1):m 
+        ra <- (acf(res, lag.max = m, plot = FALSE)$acf)[-1]
+        QQ <- n * (n + 2) * cumsum((ra^2)/(n - (1:m)))[df]
+        
+        pv <- 1 - pchisq(QQ, df)
+        QQ <- round(QQ, 2)
+        a <- matrix(c(df, QQ, pv), ncol = 3)
+        dimnames(a) <- list(rep("", length(QQ)), c("m", "Qm", "pvalue"))
+        if(ifPlot){
+                plot(x = a[,1],y = a[,3],
+                     ylim = c(0,1), pch = 15, col = "lightblue",
+                     ylab = "p-value", xlab = "m",
+                     main = "Ljung-Box portmanteau test")
+                abline(h =0.05, col =2)
+                abline(h =0.01, col =4)
+                grid()
+        }else {
+                a
+        }
+}
+```
+
+
+\ \ \ \ \   
+
+#### Download delinquency rates and real GDP data from Quercus. Calculate the changes of real GDP using the following R codes. 
+
+```{r}
+dat = read.csv("~/Downloads/GDPC1.csv")
+diff= diff(dat[,2])/100
+RGDP = ts(diff, frequency = 4, end = c(2020,3))
+dat1 = read.csv("~/Downloads/DRCLACBS.csv")
+DR = ts(dat1[,2], frequency = 4, start= c(1987,1))
+```
+
+
+#### __1. Use the data between 1987 Q1 and 2018 Q3 to study the relationship between the changes of real GDP and delinquency rates.__      
+
+```{r, echo=FALSE}
+#' @split training and forecasting sample
+#'
+RGDP.training = window(RGDP,frequency = 4, start= c(1987,1), end = c(2018,3))
+DR.training= window(DR,frequency = 4, start= c(1987,1), end = c(2018,3))
+
+#' @plot (using ts.plot or autoplot)
+#'
+plot(DR.training, col="red", ylim=c(-4,5))
+lines(RGDP.training)
+grid()
+```
+
+#### __2. Model this relationship using the transfer function noise model.(For simplicity, assume that both delinquency rates and changes of real GDP are stationary.)__ {.tabset}
+
+##### 1) Conduct `prewhitening` analysis to identify the lead-lag relationship between changes of real GDP and delinquency rates;          
+
+###### ARMA model for changes of real GDP and its residual ACF and PACF plots
+   
+```{r}
+#' @prewhiten x
+#'
+mod.arma<-auto.arima(RGDP.training, max.p = 52, max.q = 52, stationary = TRUE) 
+p = mod.arma$arma[1]; q = mod.arma$arma[2]
+coef(mod.arma)
+plot(mod.arma)
+npq = sum(mod.arma$arma[c(1,2)])
+
+layout(matrix(c(1,2,3,3), 2, 2, byrow = TRUE))
+acf(mod.arma$residuals)
+pacf(mod.arma$residuals)
+LBTest(mod.arma$residuals, nPQ = npq, m = 24, ifPlot = TRUE)
+legend("topright", col =c("red", "skyblue"),legend = c("5% significance level","test results"), bty = "n", lty=c(1,NA), pch=c(NA,15), lwd = 3)
+```
+
+* The residuals of ARMA model for changes of real GDP are not serially correlated, so the model is adequate.
+
+###### Use cross correlation plot of prewhitened processes to identify transfer function ($\nu_i$)
+
+```{r}
+#' @prewhiten y
+#'
+mod = mod.arma; nAR = mod$arma[1]; nMA = mod$arma[2]
+
+if(nMA!=0){
+  xf = PreWhiten.arma(RGDP.training, ar = mod$coef[1:nAR], 
+                      ma = mod$coef[(1:nMA)+nAR])[-(1:nAR)]
+  yf = PreWhiten.arma(DR.training, ar = mod$coef[1:nAR], 
+                      ma=mod$coef[(1:nMA)+nAR])[-(1:nAR)]  
+}else{
+  xf = PreWhiten.arma(RGDP.training, ar = mod$coef[1:nAR], 
+                      ma = 0)[-(1:nAR)]
+  yf = PreWhiten.arma(DR.training, ar = mod$coef[1:nAR], 
+                      ma=0)[-(1:nAR)] 
+}
+
+#' @ccf plot prewhiten x and y
+#'
+par(cex=0.75)
+ccf(c(xf), c(yf), lwd=4, ylab="Cross-correlation functions",
+    main="CCF of prewhitened GFT and flu test")
+abline(v=0, col="gold", lwd=1, lty="dashed")
+
+```
+
+* As indicated in the above cross-correlation plot, we include $RGDP_{t}$, $RGDP_{t-1}$, $RGDP_{t-2}$, $RGDP_{t-3}$, $RGDP_{t-4}$, $RGDP_{t-5}$ in our transfer function noise model. The correlations in this region are negative, indicating that a below average value of Real GDP is likely to lead to an above average value of delinquency rate.
+
+
+##### 2) Fit a multiple regression using the findings in the `prewhitening` step, i.e.
+$$y_t = \sum_i v_i x_{t-i} +\xi_t,~~~(1)$$
+where $y_t$ and $x_t$ denote the output and input process, respectively, and $\xi_t$ is the noise process.(Hint: Use `prewhitening` to select the lagged $\{x_i\}$ in the regression)
+
+```{r}
+#' @fit Equation (1)
+#'
+y<-DR.training
+x<-RGDP.training
+
+library(zoo)
+mod.dynlm=dynlm::dynlm(y~L(x,0:5))
+
+#' @plot residual ACF and PACF of the above regression
+#'
+layout(matrix(c(1,2,3,3), 2, 2, byrow = TRUE))
+acf(mod.dynlm$residuals)
+pacf(mod.dynlm$residuals)
+LBTest(mod.dynlm$res, nPQ = 6, m = 52, ifPlot = TRUE)
+legend("topright", col =c("red", "skyblue"),legend = c("5% significance level","test results"), bty = "n", lty=c(1,NA), pch=c(NA,15), lwd = 3)
+```
+
+* The fitted multiple regression model is not adequate since the plots of ACF and portmanteau test show that there is a serial correlation between the residuals. 
+
+##### 3) Fit a transfer function noise model using the rational distributed lag function, i.e. 
+$$y_t = \frac{\delta(B)}{\omega(B)}x_t+n_t,~~~(2)$$
+where $\delta(B)$ and $\omega(B)$ are polynomials in the backward shift operator $B$, and $n_t$ follows an ARMA process. Write down the mathematical representation of the fitted model.
+
+```{r}
+#' @fit Equation (2) and show the fitted model
+#'
+RGDP.1987 = window(RGDP,frequency = 4, start= c(1987,1))
+DR.1987= window(DR,frequency = 4, start= c(1987,1))
+
+len = length(RGDP.1987)
+a=cbind(RGDP.1987[-c(1,2,3,4,5)], RGDP.1987[-c(1,2,3,4,len)], RGDP.1987[-c(1,2,3,len-1,len)], RGDP.1987[-c(1,2,len-2,len-1,len)], RGDP.1987[-c(1,len-3,len-2,len-1,len)], RGDP.1987[-c(len-4,len-3,len-2,len-1,len)])
+a = a[-nrow(a),]
+b=DR.1987[-(1:5)]
+dat.new = cbind(b, a)
+
+colnames(dat.new)<-c("DelinquencyRate", "RGDP", "RGDP1","RGDP2","RGDP3","RGDP4","RGDP5")
+
+mod.tfn = auto.arima(dat.new[1:122,1], xreg = dat.new[1:122,-1], stationary=TRUE)
+summary(mod.tfn)
+```
+
+* __The mathematical equation of TF model__
+
+$$y_t-0.0597y_{t-1}-1.4679y_{t-2}-0.1989y_{t-3}+0.8041y_{t-4} =3.4411-0.0573x_t-0.0524x_{t-1}-0.0589x_{t-2}-0.0393x_{t-3}-0.0429x_{t-4}-0.0454x_{t-5}+n_t$$  
+$$n_t=a_t+1.2928a_{t-1}+0.0274a_{t-2}-0.4074a_{t-3}$$
+$$a_t \sim NID(0,\sigma^2_a)$$
+
+##### 4) Conduct the model adequacy tests (diagnostics) on the above model and conclude your inference.   
+
+```{r, echo=FALSE}
+#' @check model adequacy of residual serial correlation
+#'
+layout(matrix(c(1,2,3,3), 2, 2, byrow = TRUE))
+acf(mod.tfn$residuals)
+pacf(mod.tfn$residuals)
+LBTest(mod.tfn$res, nPQ =  sum(mod.tfn$arma[c(1,2)]), m = 40, ifPlot = TRUE)
+legend("topright", col =c("red", "skyblue"),legend = c("5% significance level","test results"), bty = "n", lty=c(1,NA), pch=c(NA,15), lwd = 3, cex=0.5)
+```
+```{r, echo=FALSE}
+#' @check model adequacy of residual crosss correlation 
+#'
+m = 40
+lags = 1:m
+df <- (4+6):m
+n = length(mod.tfn$res)
+mod.res=mod$residuals[-(1:5)]
+rccf = ccf(mod.res, mod.tfn$residuals, plot = FALSE, lag.max = m)$acf[-(1:m)]
+Qm = n* (n + 2) * cumsum((rccf^2)/(n - (0:m)))[df]
+pv <- 1 - pchisq(Qm, df)
+a = cbind(df, Qm,pv)
+plot(x = a[,1],y = a[,3],
+     ylim = c(0,0.2), pch = 15, col =4,
+     ylab = "p-value", xlab = "m",
+     main = "Cross-correlation check")
+abline(h =0.05, col =2)
+grid()
+```
+
+* The TFN model fitted is adequate since there is no evidence showing that the residuals are serially correlated. Therefore the observations are independent. From the cross-correlation check plot, the p-value at lag 33 is greater than 5% significance level. In practice, significance levels are usually lower than this, so the model is adequate and the time series of Real GDP is uncorrelated to the noise.
+
+
+\ \ \ \ 
+
+#### __3. Conduct the out of sample forecasts of the above fitted models using the remaining observations. Calculate the forecast performance using Mean squared error (MSE), Mean absolute error (MAE), and Mean absolute percentage error (MAPE):__ {.tabset}
+$$MSE = \sqrt \frac{\sum_{i=1}^L (y_{t+i}-\hat y_t(i))^2}{L}$$
+$$MAE = \frac{\sum_{i=1}^L \left|y_{t+i}-\hat y_t(i)\right|}{L}$$
+$$MAPE = \frac{1}{L}\sum_{i=1}^L \left|1-\frac{\hat y_t(i)}{y_{t+i}}\right|,$$
+where $\hat y_t(i)$ denotes the forecast at origin $t$ with lead time $i$
+
+```{r}
+#' @forecast using tfn
+#'
+data.test = dat.new[123:129,]
+colnames(data.test)<-c("DelinquencyRate", "RGDP", "RGDP1","RGDP2","RGDP3","RGDP4","RGDP5")
+yobs = data.test[,1]
+yhat = forecast(mod.tfn, xreg = data.test[1:7,-1])$mean[1:7]
+
+#' @calculate MSE, MAE, MAPE 
+#'
+r1=cbind(mse=sqrt(mean((yobs-yhat)^2)), mae= mean(abs(yobs-yhat)), mape= mean(abs(1-yhat/yobs)))
+knitr::kable(r1, caption ="Peformance metrics of TFN model") 
+```
+
+
+\ \ \ \  
+
+#### __4. Conduct the same out of sample forecasts soley on $y_t$ using an ARIMA model. Compare and discuss its peformance metrics with the TFN model.__ {.tabset}
+
+
+```{r}
+#' @forecat using auto.arima
+#'
+mod.arma.y = auto.arima(DR.training)
+round(coef(mod.arma.y),2)
+LBTest(mod.arma.y$res, nPQ = sum(mod.arma.y$arma[c(1,2)]), m = 40, ifPlot = TRUE)
+abline(h = 0.01, col = "green")
+legend("topright", col =c("red","green", "skyblue"),legend = c("5% significance level","1% significance level","test results"), bty = "n", lty=c(1,1,NA), pch=c(NA,NA,15), lwd = 3)
+yobs = data.test[,1]
+yhat1 = forecast(mod.arma.y, h=7)$mean
+
+#' @calculate MSE, MAE, MAPE 
+#'
+r2 = cbind(mse1=sqrt(mean((yobs-yhat1)^2)), mae1= mean(abs(yobs-yhat1)), mape1 = mean(abs(1-yhat1/yobs)))
+knitr::kable(r2, caption ="Peformance metrics of ARIMA model fitted on Yt")
+
+```
+
+* MSE, MAE and MAPE of ARIMA model fitted using delinquency rates are less than the ones of TFN model. It indicates that the ARIMA model forecasts with less error.
+
+#### __5. Conduct the same out of sample forecast analysis using forecast combination of the fitted TFN model and ARIMA model (equal weight and MSE weighting). Compare its forecast metrics with those in the previous two questions__ {.tabset}
+
+##### Equal weight
+
+```{r}
+#' @calculate MSE, MAE, MAPE for the equal weight forecast
+#'
+equal.forecaster = 0.5*yhat+0.5*yhat1
+r3=cbind(mse=sqrt(mean((yobs-equal.forecaster)^2)), mae= mean(abs(yobs-equal.forecaster)), mape= mean(abs(1-equal.forecaster/yobs)))
+knitr::kable(r3, caption ="Peformance metrics of equally weighted combined forecaster")
+```
+
+##### MSE scheme weight 
+
+```{r}
+#' @calculate MSE scheme weight
+#'
+dx= yhat-yobs
+dy= yhat1-yobs
+f = function(w) (var(w*dx+(1-w)*dy))
+wmin = optimize(f, c(0,1))
+wmin$minimum
+
+#' @calculate MSE, MAE, MAPE for the above combination forecast
+#'
+mse.forecaster = wmin$minimum*yhat+(1-wmin$minimum)*yhat1
+
+r4 = cbind(mse=sqrt(mean((yobs-mse.forecaster)^2)), mae= mean(abs(yobs-mse.forecaster)), mape= mean(abs(1-mse.forecaster/yobs)))
+knitr::kable(r4, caption ="Peformance metrics of MSE weighting combined forecaster")
+```
+
+##### Comparison
+
+```{r}
+k = rbind(r1,r2,r3,r4)
+row.names(k) = c("TFN model","ARIMA model","Equal weight", "MSE weight")
+knitr::kable(k, digits = 3)
+```
+
+* From this table we can conclude that equal weighted forecaster has a smaller MSE, MAE and MAPE than when using TFN model to forecast. So forecasting using TFN model gives the largest errors, and forecasting using ARIMA model of the responsive time series produces the smallest errors. When using the MSE weighting scheme, the weight of ARIMA model forecaster is almost 1 and the weight of TFN model forecaster is almost 0. Therefore, the MSE weighting scheme produces results that are the same as the results of using ARIMA model.
+
+\ \ \ \  
+
+* __Reference:__ William W.S. Wei (2006), _Time Series Analysis--Univariate and Multivariate Methods_, Second Edition. (Chapter 14)
+
